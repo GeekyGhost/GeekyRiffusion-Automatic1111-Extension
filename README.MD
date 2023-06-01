@@ -4,6 +4,10 @@
 
 ![Screenshot](/static/screenshot-1.png)
 
+WARNING! This version is going to have a lot of experimental tweaks. I would probably stick to the main branches. I'm going to be makig a lot of changes over time and experimenting. This was your heads up lol. 
+
+
+
 ## Installation
 - Make sure `ffmpeg` is installed and the folder with the binaries is in your `PATH`
 - Clone this repo inside your `/extensions` folder, or use the Install from URL functionality in the UI
