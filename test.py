@@ -113,6 +113,30 @@ class RiffusionScript(scripts.Script):
             show_audio_button,
             *audio_players,
         ]
+    
+    def audio_to_midi(audio_file_path: str, midi_file_path: str):
+        y, sr = librosa.load(audio_file_path)
+    
+        # Detect onsets and pitches
+        onsets = librosa.onset.onset_detect(y, sr=sr, units='time')
+        pitches, magnitudes = librosa.piptrack(y, sr=sr)
+    
+        # Calculate pitch as the weighted mean of frequencies
+        pitches = pitches[magnitudes > np.median(magnitudes)]
+        if len(pitches) > 0:
+            pitch = mean(pitches)
+        else:
+            pitch = 0
+
+        # Convert pitches to MIDI notes
+        midi_notes = librosa.hz_to_midi(pitches)
+
+        # Use the magnitudes to estimate note velocities
+        velocity = np.int16(magnitudes / np.max(magnitudes) * 127)
+
+        # Write to MIDI file
+        midiwrite(midi_file_path, onsets, midi_notes, velocity, sr)
+
 
     def play_input_as_sound(self):
         pass
@@ -507,16 +531,30 @@ def find_cutoff(image, rhythm = 4, band_start = 0.25, band_length = 0.75, thresh
     result["cutoff"] = cutoff
     return result
 
-def on_ui_tabs():
-    with gr.Blocks() as riffusion_ui:
-        with gr.Row():
-            with gr.Column(variant="panel"):
-                with gr.Row():
-                    image_directory = gr.Textbox(
-                        label="Image Directory",
-                        placeholder="Directory containing your image files",
+            def on_ui_tabs():
+                with gr.Blocks() as riffusion_ui:
+                    with gr.Row():
+                with gr.Column(variant="panel"):
+                    audio_file_path = gr.Textbox(
+                        label="Audio File",
+                        placeholder="Path to the audio file to convert",
                         value="",
                         interactive=True,
+                    )
+                    midi_file_path = gr.Textbox(
+                        label="MIDI File",
+                        placeholder="Path to save the MIDI file",
+                        value="",
+                        interactive=True,
+                    )
+                    convert_to_midi_btn = gr.Button(
+                        "Convert to MIDI", label="Convert to MIDI", variant="primary"
+                    )
+                    convert_to_midi_btn.click(
+                        audio_to_midi,
+                        inputs=[audio_file_path, midi_file_path],
+                        outputs=[],
+                    )
                     )
                 with gr.Row():
                     join_images = gr.Checkbox(
