@@ -1,28 +1,36 @@
 # All the audio related code was shamelessly copied from the original author(s):
 # https://github.com/hmartiro/riffusion-inference
 
+# Standard Library Imports
 import io
-import typing as T
 import os
+import glob
+import wave
+import platform
+from datetime import datetime
+from statistics import mean, median
+from tkinter import filedialog
+
+# Third Party Imports
 import numpy as np
-import librosa
 import pretty_midi
-from PIL import Image, ImageDraw
-from scipy.io import wavfile
+import librosa
 import torch
 import torchaudio
 import gradio as gr
+from PIL import Image, ImageDraw
+from scipy.io import wavfile
+from pydub import AudioSegment
+from pedalboard.io import AudioFile
+
+# Local Imports
+import typing as T
+import modules.shared as shared
 from modules import scripts, script_callbacks
 from modules.images import FilenameGenerator
 from modules.processing import process_images
-import os
-import modules.shared as shared
-from pedalboard.io import AudioFile
-import glob
-from datetime import datetime
-import wave
-import platform
-from statistics import mean, median
+
+
 
 base_dir = scripts.basedir()
 
@@ -114,28 +122,6 @@ class RiffusionScript(scripts.Script):
             *audio_players,
         ]
     
-    def audio_to_midi(audio_file_path: str, midi_file_path: str):
-        y, sr = librosa.load(audio_file_path)
-    
-        # Detect onsets and pitches
-        onsets = librosa.onset.onset_detect(y, sr=sr, units='time')
-        pitches, magnitudes = librosa.piptrack(y, sr=sr)
-    
-        # Calculate pitch as the weighted mean of frequencies
-        pitches = pitches[magnitudes > np.median(magnitudes)]
-        if len(pitches) > 0:
-            pitch = mean(pitches)
-        else:
-            pitch = 0
-
-        # Convert pitches to MIDI notes
-        midi_notes = librosa.hz_to_midi(pitches)
-
-        # Use the magnitudes to estimate note velocities
-        velocity = np.int16(magnitudes / np.max(magnitudes) * 127)
-
-        # Write to MIDI file
-        midiwrite(midi_file_path, onsets, midi_notes, velocity, sr)
 
 
     def play_input_as_sound(self):
@@ -531,145 +517,219 @@ def find_cutoff(image, rhythm = 4, band_start = 0.25, band_length = 0.75, thresh
     result["cutoff"] = cutoff
     return result
 
-            def on_ui_tabs():
-                with gr.Blocks() as riffusion_ui:
-                    with gr.Row():
-                with gr.Column(variant="panel"):
-                    audio_file_path = gr.Textbox(
-                        label="Audio File",
-                        placeholder="Path to the audio file to convert",
-                        value="",
-                        interactive=True,
-                    )
-                    midi_file_path = gr.Textbox(
-                        label="MIDI File",
-                        placeholder="Path to save the MIDI file",
-                        value="",
-                        interactive=True,
-                    )
-                    convert_to_midi_btn = gr.Button(
-                        "Convert to MIDI", label="Convert to MIDI", variant="primary"
-                    )
-                    convert_to_midi_btn.click(
-                        audio_to_midi,
-                        inputs=[audio_file_path, midi_file_path],
-                        outputs=[],
-                    )
-                    )
-                with gr.Row():
-                    join_images = gr.Checkbox(
-                        label="Also output single joined audio file (will be named <date>_joined.wav)",
-                        value=True,
-                        interactive=True,
-                    )
-                with gr.Row():
-                    file_regex = gr.Textbox(
-                        label="GLOB patterns (comma separated)",
-                        value="*.jpg, *.png",
-                        interactive=True,
-                    )
 
-                crop_method = gr.Dropdown(
-                    label="Crop method",
-                    choices=["None", "Fixed", "Beat Finder (Once)", "Beat Finder (Every)"],
-                    value="None",
+def audio_to_midi(audio_file_path: str, midi_folder_path: str):
+    # Load the audio file
+    y, sr = librosa.load(audio_file_path)
+
+    # Harmonic-percussive source separation
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+    # Compute the constant-Q transform of the harmonic component
+    cqt = np.abs(librosa.cqt(y_harmonic, sr=sr))
+
+    # Apply NMF to the magnitude of the CQT to separate pitches
+    components, activations = librosa.decompose.decompose(cqt, n_components=10, sort=True)
+
+    # Compute the pitch of each component using the center of mass method
+    pitches = []
+    for component in components:
+        frequency = librosa.cqt_frequencies(len(component), fmin=librosa.note_to_hz('C1'), bins_per_octave=12)
+        magnitude = np.abs(component)
+        pitch = np.sum(frequency * magnitude) / np.sum(magnitude)
+        pitches.append(pitch)
+
+    # Detect onsets on the percussive component
+    onsets = librosa.onset.onset_detect(y=y_percussive, sr=sr, units='time')
+
+    # If no onsets are detected, divide the audio into equal length frames
+    if len(onsets) == 0:
+        frame_length = 0.5  # frame length in seconds, adjust as necessary
+        onsets = np.arange(0, len(y)/sr, frame_length)
+
+    onsets_samples = librosa.time_to_samples(onsets, sr=sr)
+
+    # Convert pitches to MIDI notes
+    midi_notes = librosa.hz_to_midi(pitches)
+
+    # Estimate note durations based on onset times
+    onsets = librosa.frames_to_time(np.where(activations > 0.5)[1], sr=sr)
+    durations = np.diff(np.hstack([onsets, np.max(onsets)]))
+
+    # Create a PrettyMIDI object
+    midi_object = pretty_midi.PrettyMIDI()
+
+    # Create an Instrument instance for a piano instrument
+    piano_program = pretty_midi.instrument_name_to_program('Acoustic Grand Piano')
+    piano = pretty_midi.Instrument(program=piano_program)
+
+    # Iterate over note times and create note instances for each
+    for onset, duration, pitch in zip(onsets, durations, midi_notes):
+        # Ensuring the values are in the correct type and range
+        start = float(onset)
+        end = start + duration
+        pitch = int(round(pitch))  # MIDI pitches must be integer values
+
+        # Create a Note instance for this note
+        note = pretty_midi.Note(velocity=64, pitch=pitch, start=start, end=end)
+
+        # Add it to our piano instrument
+        piano.notes.append(note)
+
+    # Add the piano instrument to the PrettyMIDI object
+    midi_object.instruments.append(piano)
+
+    # Save the MIDI data to the specified folder
+    midi_file_name = audio_file_path.split('/')[-1] + '.mid'
+    midi_object.write(os.path.join(midi_folder_path, midi_file_name))
+
+
+def on_ui_tabs():
+    with gr.Blocks() as riffusion_ui:
+        with gr.Row():
+            with gr.Column(variant="panel"):
+                image_directory = gr.Textbox(
+                    label="Image Directory",
+                    placeholder="Directory containing your image files",
+                    value="",
                     interactive=True,
-                    allow_custom_value=False
                 )
-                with gr.Column(visible=False) as fixed_block:
-                    crop_width = gr.Number(
-                        label="Fixed width",
-                        value=512,
+            with gr.Column(variant="panel"):
+                audio_file_path = gr.Textbox(
+                    label="Audio File",
+                    placeholder="Path to the audio file to convert",
+                    value="",
+                    interactive=True,
+                )
+                midi_folder_path = gr.Textbox(
+                    label="MIDI File",
+                    placeholder="Path to save the MIDI file",
+                    value="",
+                    interactive=True,
+                )
+                convert_to_midi_btn = gr.Button(
+                    "Convert to MIDI", label="Convert to MIDI", variant="primary"
+                )
+                convert_to_midi_btn.click(
+                    audio_to_midi,
+                    inputs=[audio_file_path, midi_folder_path],
+                    outputs=[],
+                )
+            with gr.Row():
+                join_images = gr.Checkbox(
+                    label="Also output single joined audio file (will be named <date>_joined.wav)",
+                    value=True,
+                    interactive=True,
+                )
+            with gr.Row():
+                file_regex = gr.Textbox(
+                    label="GLOB patterns (comma separated)",
+                    value="*.jpg, *.png",
+                    interactive=True,
+                )
+
+            crop_method = gr.Dropdown(
+                label="Crop method",
+                choices=["None", "Fixed", "Beat Finder (Once)", "Beat Finder (Every)"],
+                value="None",
+                interactive=True,
+                allow_custom_value=False
+            )
+            with gr.Column(visible=False) as fixed_block:
+                crop_width = gr.Number(
+                    label="Fixed width",
+                    value=512,
+                    precision=0,
+                    interactive=True,
+                )
+
+            with gr.Column(visible=False) as beat_finder_block:
+                with gr.Row():
+                    rhythm = gr.Number(
+                        label="Rhythm",
+                        value=4,
                         precision=0,
                         interactive=True,
                     )
 
-                with gr.Column(visible=False) as beat_finder_block:
-                    with gr.Row():
-                        rhythm = gr.Number(
-                            label="Rhythm",
-                            value=4,
-                            precision=0,
-                            interactive=True,
-                        )
-
-                        band_start = gr.Slider(
-                            label="Band start",
-                            min=0,
-                            max=0.99,
-                            step=0.05,
-                            value=0.25,
-                            interactive=True,
-                        )
-
-                        band_length = gr.Slider(
-                            label="Band length",
-                            min=0.01,
-                            max=1,
-                            step=0.05,
-                            value=0.5,
-                            interactive=True,
-                        )
-                    with gr.Row():
-                        threshold_offset = gr.Slider(
-                            label="Threshold",
-                            min=0.01,
-                            max=1,
-                            step=0.05,
-                            value=0.1,
-                            interactive=True,
-                        )
-
-                        ignore_range = gr.Slider(
-                            label="Ignore range",
-                            min=0,
-                            max=1,
-                            step=0.05,
-                            value=0.1,
-                            interactive=True,
-                        )
-                    with gr.Column():
-                        test_beat_finder_button = gr.Button(
-                            "Test", label="Test", variant="primary"
-                        )
-                        beat_finder_image = gr.Image(type="pil")
-                        test_beat_finder_button.click(
-                            on_beat_finder_test_click,
-                            inputs=[
-                                image_directory,
-                                file_regex,
-                                rhythm,
-                                band_start,
-                                band_length,
-                                threshold_offset,
-                                ignore_range
-                            ],
-                            outputs=[beat_finder_image],
-                        )
-                
-                crop_method.change(on_crop_method_change, crop_method, [fixed_block,beat_finder_block])
-            with gr.Column(variant="panel"):
-                with gr.Row():
-                    convert_folder_btn = gr.Button(
-                        "Convert Folder", label="Convert Folder", variant="primary"
+                    band_start = gr.Slider(
+                        label="Band start",
+                        min=0,
+                        max=0.99,
+                        step=0.05,
+                        value=0.25,
+                        interactive=True,
                     )
-                    convert_folder_btn.click(
-                        convert_audio,
+
+                    band_length = gr.Slider(
+                        label="Band length",
+                        min=0.01,
+                        max=1,
+                        step=0.05,
+                        value=0.5,
+                        interactive=True,
+                    )
+                with gr.Row():
+                    threshold_offset = gr.Slider(
+                        label="Threshold",
+                        min=0.01,
+                        max=1,
+                        step=0.05,
+                        value=0.1,
+                        interactive=True,
+                    )
+
+                    ignore_range = gr.Slider(
+                        label="Ignore range",
+                        min=0,
+                        max=1,
+                        step=0.05,
+                        value=0.1,
+                        interactive=True,
+                    )
+                with gr.Column():
+                    test_beat_finder_button = gr.Button(
+                        "Test", label="Test", variant="primary"
+                    )
+                    beat_finder_image = gr.Image(type="pil")
+                    test_beat_finder_button.click(
+                        on_beat_finder_test_click,
                         inputs=[
                             image_directory,
                             file_regex,
-                            join_images,
-                            crop_method,
-                            crop_width,
                             rhythm,
                             band_start,
                             band_length,
                             threshold_offset,
                             ignore_range
                         ],
-                        outputs=[],
+                        outputs=[beat_finder_image],
                     )
-                gr.HTML(value="<p>Converts all images in a folder to audio</p>")
+
+            crop_method.change(on_crop_method_change, crop_method, [fixed_block,beat_finder_block])
+
+        with gr.Column(variant="panel"):
+            with gr.Row():
+                convert_folder_btn = gr.Button(
+                    "Convert Folder", label="Convert Folder", variant="primary"
+                )
+                convert_folder_btn.click(
+                    convert_audio,
+                    inputs=[
+                        image_directory,
+                        file_regex,
+                        join_images,
+                        crop_method,
+                        crop_width,
+                        rhythm,
+                        band_start,
+                        band_length,
+                        threshold_offset,
+                        ignore_range
+                    ],
+                    outputs=[],
+                )
+            gr.HTML(value="<p>Converts all images in a folder to audio</p>")
     return ((riffusion_ui, "Riffusion", "riffusion_ui"),)
 
 def on_beat_finder_test_click(image_dir: str,
@@ -690,4 +750,5 @@ def on_crop_method_change(crop_method):
     return gr.update(visible=fixed_visible), gr.update(visible=beat_finder_visible)
 
 script_callbacks.on_ui_tabs(on_ui_tabs)
+
 
